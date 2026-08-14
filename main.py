@@ -16,24 +16,31 @@ from PyQt6.QtCore import (
     Qt,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen, QPixmap
-from PyQt6.QtWidgets import (
-    QApplication,
-    QFileDialog,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QMessageBox,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
+from PyQt6.QtGui import (
+    QColor,
+    QCursor,
+    QFont,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
 )
+from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
+from desktop_selection import (
+    DesktopSelection,
+    DesktopSelectionUnavailable,
+    clicked_desktop_file,
+    cursor_position,
+    escape_key_down,
+    left_button_down,
+)
 from safety import FileFingerprint, assert_unchanged, validate_target
 
 
 APP_NAME = "WisadelDeleter"
-MENU_LABEL = "召唤维什戴尔处理此文件"
+MENU_LABEL = "召唤维什戴尔"
 
 
 def resource_path(relative: str) -> Path:
@@ -339,14 +346,33 @@ class ExpressionBurst(QWidget):
         )
 
 
+class TargetReticle(QWidget):
+    """A highlight around the real desktop icon, never a fabricated file icon."""
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        area = self.rect().adjusted(5, 5, -5, -5)
+        painter.setPen(QPen(QColor(255, 44, 70, 230), 4))
+        painter.setBrush(QColor(215, 25, 50, 35))
+        painter.drawRoundedRect(QRectF(area), 17, 17)
+        painter.setPen(QPen(QColor("#fff4a3"), 3))
+        center = area.center()
+        painter.drawLine(center.x() - 14, center.y(), center.x() + 14, center.y())
+        painter.drawLine(center.x(), center.y() - 14, center.x(), center.y() + 14)
+
+
 class WisadelDeleter(QWidget):
     def __init__(self, initial_target: str | None = None) -> None:
         super().__init__()
         self._target: Path | None = None
         self._fingerprint: FileFingerprint | None = None
+        self._target_center = QPoint()
         self._bomb_launched = False
         self._deletion_ok = False
-        self._initial_target = initial_target
+        self._last_error = ""
+        self._waiting_for_desktop = False
+        self._left_was_down = False
 
         self.setWindowTitle("维什戴尔的爆破委托")
         self.setWindowFlags(
@@ -355,7 +381,7 @@ class WisadelDeleter(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setGeometry(QApplication.primaryScreen().geometry())
+        self.setGeometry(QApplication.primaryScreen().virtualGeometry())
 
         self.sprite = SpriteAnimator(self)
         self.sprite.load_sheet(resource_path("assets/wisadel_april_fools_spritesheet-v3.png"))
@@ -369,107 +395,49 @@ class WisadelDeleter(QWidget):
         self.expression_burst = ExpressionBurst(self)
         self.expression_burst.finished.connect(self._show_result)
 
-        self.target_marker = QLabel("", self)
-        self.target_marker.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.target_marker.setWordWrap(True)
-        self.target_marker.setStyleSheet(
-            "color:white; font:700 16px 'Microsoft YaHei'; padding:12px; "
-            "background:rgba(17,19,24,225); border:2px solid #d71932; border-radius:24px;"
-        )
-        self.target_marker.resize(220, 170)
+        self.target_marker = TargetReticle(self)
+        self.target_marker.resize(110, 110)
         self.target_marker.hide()
 
-        self.card = self._build_card()
-        self.card.hide()
         self.status = QLabel("正在召唤维什戴尔……", self)
+        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status.setStyleSheet(
-            "color:white; font: 700 24px 'Microsoft YaHei'; background:rgba(10,11,15,205); padding:14px 24px; border-radius:16px;"
+            "color:white; font:700 24px 'Microsoft YaHei'; "
+            "background:rgba(10,11,15,215); padding:14px 24px; border-radius:16px;"
         )
         self.status.adjustSize()
+
+        self._selection_timer = QTimer(self)
+        self._selection_timer.setInterval(35)
+        self._selection_timer.timeout.connect(self._poll_desktop_input)
 
         self._position_widgets()
         QTimer.singleShot(250, self._start_summon)
 
-    def _build_card(self) -> QFrame:
-        card = QFrame(self)
-        card.setObjectName("card")
-        card.setStyleSheet(
-            """
-            QFrame#card { background: rgba(18,20,27,244); border: 1px solid #444957; border-radius: 24px; }
-            QLabel { color: #f4f6fb; font-family: 'Microsoft YaHei'; }
-            QPushButton { border: 0; border-radius: 14px; padding: 13px 22px; font: 700 16px 'Microsoft YaHei'; }
-            QPushButton#choose { background: #3a3f4c; color: white; }
-            QPushButton#cancel { background: #30333c; color: #d8dbe4; }
-            QPushButton#confirm { background: #d71932; color: white; }
-            QPushButton#confirm:disabled { background: #4a4d57; color: #a5a9b4; }
-            QPushButton:hover { border: 2px solid white; }
-            """
-        )
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(30, 26, 30, 26)
-        layout.setSpacing(14)
-        title = QLabel("爆破委托确认")
-        title.setStyleSheet("font-size: 27px; font-weight: 800;")
-        copy = QLabel("维什戴尔将向下列目标投掷炸弹。目标会被移入系统回收站，可尝试恢复。")
-        copy.setWordWrap(True)
-        copy.setStyleSheet("font-size: 15px; color: #bcc1ce;")
-        self.path_label = QLabel("尚未选择文件")
-        self.path_label.setWordWrap(True)
-        self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.path_label.setMinimumHeight(48)
-        self.path_label.setStyleSheet(
-            "font-family:'Consolas','Microsoft YaHei'; font-size:14px; font-weight:600; "
-            "background:#0d0f14; border:1px solid #353945; border-radius:12px; padding:12px;"
-        )
-        self.warning = QLabel("请确认路径无误。操作只会在炸弹命中时执行。")
-        self.warning.setStyleSheet("font-size: 14px; color: #ffbd55;")
-        buttons = QHBoxLayout()
-        self.choose_button = QPushButton("选择文件")
-        self.choose_button.setObjectName("choose")
-        self.choose_button.clicked.connect(self._choose_target)
-        cancel = QPushButton("取消")
-        cancel.setObjectName("cancel")
-        cancel.clicked.connect(self.close)
-        self.confirm = QPushButton("确认并投掷")
-        self.confirm.setObjectName("confirm")
-        self.confirm.clicked.connect(self._confirm_attack)
-        buttons.addWidget(self.choose_button)
-        buttons.addStretch()
-        buttons.addWidget(cancel)
-        buttons.addWidget(self.confirm)
-        layout.addWidget(title)
-        layout.addWidget(copy)
-        layout.addWidget(self.path_label)
-        layout.addWidget(self.warning)
-        layout.addLayout(buttons)
-        card.resize(700, 300)
-        return card
-
     def _position_widgets(self) -> None:
         self.sprite.move(max(30, self.width() // 8), self.height() - 390)
         self.status.move((self.width() - self.status.width()) // 2, 45)
-        self.card.move((self.width() - self.card.width()) // 2, (self.height() - self.card.height()) // 2 - 20)
-        self.target_marker.move(
-            self.width() * 3 // 4 - self.target_marker.width() // 2,
-            self.height() // 2 - self.target_marker.height() // 2,
-        )
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         self._position_widgets()
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(4, 5, 8, 150))
-        painter.setPen(QPen(QColor(215, 25, 50, 40), 1))
-        gap = 52
-        for x in range(0, self.width(), gap):
-            painter.drawLine(x, 0, x, self.height())
-        for y in range(0, self.height(), gap):
+        opacity = 48 if self._waiting_for_desktop else 115
+        painter.fillRect(self.rect(), QColor(4, 5, 8, opacity))
+        painter.setPen(QPen(QColor(215, 25, 50, 24), 1))
+        for y in range(0, self.height(), 64):
             painter.drawLine(0, y, self.width(), y)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() == Qt.Key.Key_Escape:
             self.close()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._selection_timer.stop()
+        self.sprite.stop()
+        self.bomb.stop()
+        super().closeEvent(event)
 
     def _start_summon(self) -> None:
         self.show()
@@ -482,80 +450,129 @@ class WisadelDeleter(QWidget):
         except TypeError:
             pass
         self.sprite.play([4], fps=1, loop=True)
-        self.status.setText("维什戴尔已就位：选择爆破目标")
-        self.status.adjustSize()
-        self._position_widgets()
-        if self._initial_target:
-            self._set_target(self._initial_target)
-        else:
-            self._show_waiting_selection()
+        self._show_waiting_selection()
 
-    def _show_waiting_selection(self) -> None:
-        self._target = None
-        self._fingerprint = None
-        self.path_label.setText("尚未选择文件")
-        self.warning.setText("维什戴尔正在等待。请点击“选择文件”，确认目标后才会投掷炸弹。")
-        self.choose_button.setText("选择文件")
-        self.confirm.setEnabled(False)
-        self.confirm.setText("等待选择")
-        self.card.show()
-        self.card.raise_()
-
-    def _choose_target(self) -> None:
-        start_directory = str(self._target.parent) if self._target else str(Path.home())
-        # A hidden top-most overlay cannot cover the native Windows picker.
-        # The summoned character returns as soon as the picker closes.
-        self.hide()
-        selected, _ = QFileDialog.getOpenFileName(
-            None,
-            "选择要移入回收站的文件",
-            start_directory,
-            "所有文件 (*)",
-        )
+    def _set_click_through(self, enabled: bool) -> None:
+        if sys.platform != "win32":
+            return
+        flags = self.windowFlags()
+        transparent = Qt.WindowType.WindowTransparentForInput
+        already_enabled = bool(flags & transparent)
+        if already_enabled == enabled:
+            return
+        self.setWindowFlags(flags | transparent if enabled else flags & ~transparent)
         self.show()
         self.raise_()
-        if not selected:
-            if self._target is None:
-                self._show_waiting_selection()
-            else:
-                self.card.show()
-                self.card.raise_()
-            return
-        self._set_target(selected)
 
-    def _set_target(self, selected: str) -> None:
-        try:
-            target, saved_fingerprint = validate_target(selected, __file__)
-        except (OSError, ValueError) as error:
-            QMessageBox.warning(self, "无法选择目标", str(error))
-            if self._target is None:
-                self._show_waiting_selection()
+    def _show_waiting_selection(self, message: str | None = None) -> None:
+        self._target = None
+        self._fingerprint = None
+        self._bomb_launched = False
+        self._deletion_ok = False
+        self._last_error = ""
+        self._waiting_for_desktop = True
+        self._left_was_down = False
+        self.target_marker.hide()
+        self.status.setText(message or "请选择桌面上的文件图标 · 单击后立即投弹 · Esc 取消")
+        self.status.adjustSize()
+        self._position_widgets()
+        self.update()
+
+        if sys.platform == "win32":
+            self._set_click_through(True)
+            self._selection_timer.start()
+        else:
+            self.status.setText("桌面文件选取需要在 Windows 10/11 上运行")
+            self.status.adjustSize()
+            self._position_widgets()
+
+    def _poll_desktop_input(self) -> None:
+        if not self._waiting_for_desktop:
             return
+        if escape_key_down():
+            self.close()
+            return
+        pressed = left_button_down()
+        if pressed:
+            self._left_was_down = True
+            return
+        if not self._left_was_down:
+            return
+
+        self._left_was_down = False
+        try:
+            x, y = cursor_position()
+        except DesktopSelectionUnavailable as error:
+            self.status.setText(str(error))
+            self.status.adjustSize()
+            self._position_widgets()
+            return
+        # QCursor uses Qt's DPI-aware coordinates while UI Automation expects
+        # native screen coordinates. Keep both so effects stay aligned at 125%+
+        # Windows display scaling.
+        qt_click = QCursor.pos()
+        QTimer.singleShot(
+            120,
+            lambda x=x, y=y, qt_click=qt_click: self._capture_desktop_click(
+                x, y, qt_click
+            ),
+        )
+
+    def _capture_desktop_click(self, x: int, y: int, qt_click: QPoint | None = None) -> None:
+        if not self._waiting_for_desktop:
+            return
+        try:
+            selection = clicked_desktop_file(x, y)
+        except DesktopSelectionUnavailable as error:
+            self.status.setText(str(error))
+            self.status.adjustSize()
+            self._position_widgets()
+            return
+        if selection is None:
+            self.status.setText("没有识别到桌面文件，请单击真实文件图标（不支持文件夹或系统图标）")
+            self.status.adjustSize()
+            self._position_widgets()
+            return
+        self._lock_target(selection, qt_click)
+
+    def _lock_target(
+        self, selection: DesktopSelection, qt_click: QPoint | None = None
+    ) -> None:
+        try:
+            target, saved_fingerprint = validate_target(selection.path, __file__)
+        except (OSError, ValueError) as error:
+            self._show_waiting_selection(f"无法锁定：{error} 请重新选择桌面文件")
+            return
+
+        self._waiting_for_desktop = False
+        self._selection_timer.stop()
+        self._set_click_through(False)
         self._target = target
         self._fingerprint = saved_fingerprint
-        self.path_label.setText(str(target))
-        self.warning.setText("请确认路径无误。目标将移入回收站，而非永久粉碎。")
-        self.choose_button.setText("重新选择")
-        self.confirm.setEnabled(True)
-        self.confirm.setText("确认并投掷")
-        self.card.show()
-        self.card.raise_()
 
-    def _confirm_attack(self) -> None:
+        global_center = qt_click if qt_click is not None else QPoint(*selection.center)
+        self._target_center = self.mapFromGlobal(global_center)
+        marker_width = 110
+        marker_height = 110
+        self.target_marker.resize(marker_width, marker_height)
+        self.target_marker.move(
+            self._target_center - QPoint(marker_width // 2, marker_height // 2)
+        )
+        self.target_marker.show()
+        self.target_marker.raise_()
+        self.status.setText(f"锁定：{target.name}")
+        self.status.adjustSize()
+        self._position_widgets()
+        self._start_attack()
+
+    def _start_attack(self) -> None:
         if self._target is None or self._fingerprint is None:
             return
         try:
             assert_unchanged(self._target, self._fingerprint)
         except (OSError, ValueError) as error:
-            QMessageBox.warning(self, "目标已变化", str(error))
-            self._show_waiting_selection()
+            self._show_waiting_selection(f"目标已变化：{error} 请重新选择")
             return
-        self.card.hide()
-        self.target_marker.setText(f"📄\n{self._target.name}")
-        self.target_marker.show()
-        self.status.setText(f"锁定：{self._target.name}")
-        self.status.adjustSize()
-        self._position_widgets()
         self._bomb_launched = False
         self.sprite.stop()
         try:
@@ -572,8 +589,7 @@ class WisadelDeleter(QWidget):
 
     def _launch_bomb(self) -> None:
         start = self.sprite.pos() + QPoint(self.sprite.width() - 60, self.sprite.height() // 2)
-        target_center = self.target_marker.geometry().center()
-        end = target_center - QPoint(self.bomb.width() // 2, self.bomb.height() // 2)
+        end = self._target_center - QPoint(self.bomb.width() // 2, self.bomb.height() // 2)
         self.bomb.move(start)
         self.bomb.start()
         self.bomb.raise_()
@@ -587,8 +603,10 @@ class WisadelDeleter(QWidget):
 
     def _bomb_hit(self) -> None:
         self.bomb.stop()
-        center = self.target_marker.geometry().center()
-        self.explosion.move(center - QPoint(self.explosion.width() // 2, self.explosion.height() // 2))
+        self.explosion.move(
+            self._target_center
+            - QPoint(self.explosion.width() // 2, self.explosion.height() // 2)
+        )
         self.target_marker.hide()
         self._delete_target()
         self.explosion.start()
@@ -606,7 +624,7 @@ class WisadelDeleter(QWidget):
                 raise OSError("系统没有确认目标已移入回收站。")
         except Exception as error:  # Keep the UI alive and show the exact failure.
             self._deletion_ok = False
-            self.warning.setText(f"操作失败：{error}")
+            self._last_error = str(error)
 
     def _show_result(self) -> None:
         try:
@@ -618,16 +636,14 @@ class WisadelDeleter(QWidget):
             self.sprite.play([10, 11, 12, 10, 11, 12], fps=6)
             QTimer.singleShot(2300, self.close)
         else:
-            self.status.setText("任务中止：文件未被移动")
-            self.card.show()
-            self.confirm.setEnabled(False)
-            self.confirm.setText("操作未执行")
+            self.status.setText(f"任务中止：{self._last_error or '文件未被移动'}")
+            self.sprite.play([4], fps=1, loop=True)
+            QTimer.singleShot(2200, self._show_waiting_selection)
         self.status.adjustSize()
         self._position_widgets()
 
     def _start_expression_burst(self) -> None:
-        center = self.target_marker.geometry().center()
-        self.expression_burst.start(center)
+        self.expression_burst.start(self._target_center)
 
 
 def context_menu_command() -> str:
