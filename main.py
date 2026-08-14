@@ -27,6 +27,7 @@ from PyQt6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QTransform,
 )
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
@@ -60,6 +61,7 @@ class SpriteAnimator(QLabel):
         self._frames: list[QPixmap] = []
         self._index = 0
         self._loop = False
+        self._flipped = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance)
 
@@ -85,12 +87,27 @@ class SpriteAnimator(QLabel):
             self.finished.emit()
             return
         self.resize(self._frames[0].size())
-        self.setPixmap(self._frames[0])
+        self._render_frame()
         self.show()
         self._timer.start(max(1, 1000 // fps))
 
     def stop(self) -> None:
         self._timer.stop()
+
+    def set_flipped(self, flipped: bool) -> None:
+        self._flipped = flipped
+        self._render_frame()
+
+    def _render_frame(self) -> None:
+        if not self._frames:
+            return
+        frame = self._frames[self._index]
+        if self._flipped:
+            frame = frame.transformed(
+                QTransform().scale(-1, 1),
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        self.setPixmap(frame)
 
     def _advance(self) -> None:
         self._index += 1
@@ -100,10 +117,10 @@ class SpriteAnimator(QLabel):
             else:
                 self._timer.stop()
                 self._index = len(self._frames) - 1
-                self.setPixmap(self._frames[self._index])
+                self._render_frame()
                 self.finished.emit()
                 return
-        self.setPixmap(self._frames[self._index])
+        self._render_frame()
         self.frame_changed.emit(self._index)
 
 
@@ -387,6 +404,49 @@ def virtual_desktop_geometry() -> QRect:
     return united_screen_geometry(rectangles)
 
 
+def choose_attack_staging_position(
+    target: QPoint,
+    current: QPoint,
+    actor_width: int,
+    actor_height: int,
+    area: QRect,
+) -> tuple[QPoint, int]:
+    """Choose a nearby in-bounds position and horizontal throw direction."""
+    margin = 24
+    gap = 72
+    minimum_x = area.left() + margin
+    minimum_y = area.top() + margin
+    maximum_x = max(minimum_x, area.right() + 1 - actor_width - margin)
+    maximum_y = max(minimum_y, area.bottom() + 1 - actor_height - margin)
+    target_y = min(maximum_y, max(minimum_y, target.y() - actor_height // 2))
+
+    left_x = target.x() - gap - actor_width
+    right_x = target.x() + gap
+    candidates: list[tuple[QPoint, int]] = []
+    if minimum_x <= left_x <= maximum_x:
+        candidates.append((QPoint(left_x, target_y), 1))
+    if minimum_x <= right_x <= maximum_x:
+        candidates.append((QPoint(right_x, target_y), -1))
+
+    if not candidates:
+        if target.x() < area.center().x():
+            candidates.append(
+                (QPoint(min(maximum_x, max(minimum_x, right_x)), target_y), -1)
+            )
+        else:
+            candidates.append(
+                (QPoint(min(maximum_x, max(minimum_x, left_x)), target_y), 1)
+            )
+
+    return min(
+        candidates,
+        key=lambda option: (
+            (option[0].x() - current.x()) ** 2
+            + (option[0].y() - current.y()) ** 2
+        ),
+    )
+
+
 class WisadelDeleter(QWidget):
     def __init__(self, initial_target: str | None = None) -> None:
         super().__init__()
@@ -400,6 +460,8 @@ class WisadelDeleter(QWidget):
         self._waiting_for_desktop = False
         self._left_was_down = False
         self._escape_was_down = False
+        self._actor_is_staged = False
+        self._throw_direction = 1
 
         self.setWindowTitle("维什戴尔的爆破委托")
         self.setWindowFlags(
@@ -450,7 +512,8 @@ class WisadelDeleter(QWidget):
         QTimer.singleShot(250, self._start_summon)
 
     def _position_widgets(self) -> None:
-        self.sprite.move(max(30, self.width() // 8), self.height() - 390)
+        if not self._actor_is_staged:
+            self.sprite.move(max(30, self.width() // 8), self.height() - 390)
         self.status.move((self.width() - self.status.width()) // 2, 45)
 
     def _position_target_marker(self) -> None:
@@ -501,7 +564,7 @@ class WisadelDeleter(QWidget):
         self.bomb.stop()
         self.explosion.stop()
         self.expression_burst.stop()
-        for animation_name in ("bomb_animation",):
+        for animation_name in ("actor_move_animation", "bomb_animation"):
             animation = getattr(self, animation_name, None)
             if animation is not None:
                 animation.stop()
@@ -550,6 +613,9 @@ class WisadelDeleter(QWidget):
         self._last_error = ""
         self._waiting_for_desktop = True
         self._left_was_down = False
+        self._actor_is_staged = False
+        self._throw_direction = 1
+        self.sprite.set_flipped(False)
         self.target_marker.hide()
         self.status.setText(message or "请选择桌面上的文件图标 · 单击后立即投弹 · Esc 取消")
         self.status.adjustSize()
@@ -637,10 +703,52 @@ class WisadelDeleter(QWidget):
         self._position_target_marker()
         self.target_marker.show()
         self.target_marker.raise_()
-        self.status.setText(f"锁定：{target.name}")
+        self.status.setText(f"锁定：{target.name} · 正在调整投掷位置")
         self.status.adjustSize()
+        self._actor_is_staged = True
         self._position_widgets()
-        self._start_attack()
+        self._approach_target()
+
+    def _approach_target(self) -> None:
+        screen = (
+            QApplication.screenAt(self._target_global)
+            if self._target_global is not None
+            else None
+        )
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is not None:
+            screen_geometry = screen.geometry()
+            local_screen_geometry = QRect(
+                self.mapFromGlobal(screen_geometry.topLeft()), screen_geometry.size()
+            )
+        else:
+            local_screen_geometry = self.rect()
+        destination, direction = choose_attack_staging_position(
+            target=self._target_center,
+            current=self.sprite.pos(),
+            actor_width=self.sprite.width(),
+            actor_height=self.sprite.height(),
+            area=local_screen_geometry,
+        )
+        self._throw_direction = direction
+        self.sprite.set_flipped(direction < 0)
+
+        distance = math.hypot(
+            destination.x() - self.sprite.x(), destination.y() - self.sprite.y()
+        )
+        if distance < 4:
+            self.sprite.move(destination)
+            QTimer.singleShot(0, self._start_attack)
+            return
+
+        self.actor_move_animation = QPropertyAnimation(self.sprite, b"pos", self)
+        self.actor_move_animation.setDuration(min(900, max(280, int(distance * 1.1))))
+        self.actor_move_animation.setStartValue(self.sprite.pos())
+        self.actor_move_animation.setEndValue(destination)
+        self.actor_move_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.actor_move_animation.finished.connect(self._start_attack)
+        self.actor_move_animation.start()
 
     def _start_attack(self) -> None:
         if self._target is None or self._fingerprint is None:
@@ -664,8 +772,16 @@ class WisadelDeleter(QWidget):
             self._bomb_launched = True
             self._launch_bomb()
 
+    def _bomb_start_position(self) -> QPoint:
+        hand_x = self.sprite.width() - 55 if self._throw_direction > 0 else 55
+        hand_y = self.sprite.height() // 2
+        return self.sprite.pos() + QPoint(
+            hand_x - self.bomb.width() // 2,
+            hand_y - self.bomb.height() // 2,
+        )
+
     def _launch_bomb(self) -> None:
-        start = self.sprite.pos() + QPoint(self.sprite.width() - 60, self.sprite.height() // 2)
+        start = self._bomb_start_position()
         end = self._target_center - QPoint(self.bomb.width() // 2, self.bomb.height() // 2)
         self.bomb.move(start)
         self.bomb.start()
