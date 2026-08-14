@@ -4,6 +4,7 @@ import argparse
 import math
 import os
 import random
+import signal
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from PyQt6.QtCore import (
     QEasingCurve,
     QPoint,
     QPropertyAnimation,
+    QRect,
     QRectF,
     QTimer,
     Qt,
@@ -161,6 +163,10 @@ class ExplosionWidget(QWidget):
         QApplication.beep()
         self._timer.start(40)
 
+    def stop(self) -> None:
+        self._timer.stop()
+        self.hide()
+
     def _advance(self) -> None:
         self._frame += 1
         if self._frame > self._total_frames:
@@ -304,6 +310,10 @@ class ExpressionBurst(QWidget):
         self.raise_()
         self._timer.start(42)
 
+    def stop(self) -> None:
+        self._timer.stop()
+        self.hide()
+
     def _advance(self) -> None:
         self._frame += 1
         if self._frame > 20:
@@ -362,17 +372,34 @@ class TargetReticle(QWidget):
         painter.drawLine(center.x(), center.y() - 14, center.x(), center.y() + 14)
 
 
+def united_screen_geometry(rectangles: list[QRect]) -> QRect:
+    """Return one geometry covering every monitor, including negative origins."""
+    if not rectangles:
+        return QRect(0, 0, 1, 1)
+    geometry = QRect(rectangles[0])
+    for rectangle in rectangles[1:]:
+        geometry = geometry.united(rectangle)
+    return geometry
+
+
+def virtual_desktop_geometry() -> QRect:
+    rectangles = [screen.geometry() for screen in QApplication.screens()]
+    return united_screen_geometry(rectangles)
+
+
 class WisadelDeleter(QWidget):
     def __init__(self, initial_target: str | None = None) -> None:
         super().__init__()
         self._target: Path | None = None
         self._fingerprint: FileFingerprint | None = None
         self._target_center = QPoint()
+        self._target_global: QPoint | None = None
         self._bomb_launched = False
         self._deletion_ok = False
         self._last_error = ""
         self._waiting_for_desktop = False
         self._left_was_down = False
+        self._escape_was_down = False
 
         self.setWindowTitle("维什戴尔的爆破委托")
         self.setWindowFlags(
@@ -381,7 +408,7 @@ class WisadelDeleter(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setGeometry(QApplication.primaryScreen().virtualGeometry())
+        self.setGeometry(virtual_desktop_geometry())
 
         self.sprite = SpriteAnimator(self)
         self.sprite.load_sheet(resource_path("assets/wisadel_april_fools_spritesheet-v3.png"))
@@ -407,9 +434,17 @@ class WisadelDeleter(QWidget):
         )
         self.status.adjustSize()
 
-        self._selection_timer = QTimer(self)
-        self._selection_timer.setInterval(35)
-        self._selection_timer.timeout.connect(self._poll_desktop_input)
+        self._input_timer = QTimer(self)
+        self._input_timer.setInterval(35)
+        self._input_timer.timeout.connect(self._poll_global_input)
+        self._input_timer.start()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.screenAdded.connect(self._screen_added)
+            app.screenRemoved.connect(self._sync_virtual_geometry)
+            for screen in app.screens():
+                self._connect_screen(screen)
 
         self._position_widgets()
         QTimer.singleShot(250, self._start_summon)
@@ -417,6 +452,33 @@ class WisadelDeleter(QWidget):
     def _position_widgets(self) -> None:
         self.sprite.move(max(30, self.width() // 8), self.height() - 390)
         self.status.move((self.width() - self.status.width()) // 2, 45)
+
+    def _position_target_marker(self) -> None:
+        if self._target_global is None:
+            return
+        self._target_center = self.mapFromGlobal(self._target_global)
+        self.target_marker.move(
+            self._target_center
+            - QPoint(self.target_marker.width() // 2, self.target_marker.height() // 2)
+        )
+
+    def _connect_screen(self, screen) -> None:
+        try:
+            screen.geometryChanged.connect(self._sync_virtual_geometry)
+        except (AttributeError, TypeError):
+            pass
+
+    def _screen_added(self, screen) -> None:
+        self._connect_screen(screen)
+        self._sync_virtual_geometry()
+
+    def _sync_virtual_geometry(self, *args) -> None:
+        geometry = virtual_desktop_geometry()
+        if self.geometry() != geometry:
+            self.setGeometry(geometry)
+        self._position_widgets()
+        self._position_target_marker()
+        self.update()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         self._position_widgets()
@@ -434,10 +496,19 @@ class WisadelDeleter(QWidget):
             self.close()
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        self._selection_timer.stop()
+        self._input_timer.stop()
         self.sprite.stop()
         self.bomb.stop()
+        self.explosion.stop()
+        self.expression_burst.stop()
+        for animation_name in ("bomb_animation",):
+            animation = getattr(self, animation_name, None)
+            if animation is not None:
+                animation.stop()
         super().closeEvent(event)
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _start_summon(self) -> None:
         self.show()
@@ -460,13 +531,20 @@ class WisadelDeleter(QWidget):
         already_enabled = bool(flags & transparent)
         if already_enabled == enabled:
             return
+        # setWindowFlags recreates a native top-level window on Windows and can
+        # reset it to the primary monitor. Always restore the complete virtual
+        # desktop geometry immediately afterwards.
         self.setWindowFlags(flags | transparent if enabled else flags & ~transparent)
+        self.setGeometry(virtual_desktop_geometry())
         self.show()
         self.raise_()
+        self._position_widgets()
+        self._position_target_marker()
 
     def _show_waiting_selection(self, message: str | None = None) -> None:
         self._target = None
         self._fingerprint = None
+        self._target_global = None
         self._bomb_launched = False
         self._deletion_ok = False
         self._last_error = ""
@@ -480,17 +558,19 @@ class WisadelDeleter(QWidget):
 
         if sys.platform == "win32":
             self._set_click_through(True)
-            self._selection_timer.start()
         else:
             self.status.setText("桌面文件选取需要在 Windows 10/11 上运行")
             self.status.adjustSize()
             self._position_widgets()
 
-    def _poll_desktop_input(self) -> None:
-        if not self._waiting_for_desktop:
-            return
-        if escape_key_down():
+    def _poll_global_input(self) -> None:
+        escape_pressed = escape_key_down()
+        if escape_pressed and not self._escape_was_down:
+            self._escape_was_down = True
             self.close()
+            return
+        self._escape_was_down = escape_pressed
+        if not self._waiting_for_desktop:
             return
         pressed = left_button_down()
         if pressed:
@@ -545,19 +625,16 @@ class WisadelDeleter(QWidget):
             return
 
         self._waiting_for_desktop = False
-        self._selection_timer.stop()
         self._set_click_through(False)
         self._target = target
         self._fingerprint = saved_fingerprint
 
-        global_center = qt_click if qt_click is not None else QPoint(*selection.center)
-        self._target_center = self.mapFromGlobal(global_center)
+        self._target_global = qt_click if qt_click is not None else QPoint(*selection.center)
+        self._target_center = self.mapFromGlobal(self._target_global)
         marker_width = 110
         marker_height = 110
         self.target_marker.resize(marker_width, marker_height)
-        self.target_marker.move(
-            self._target_center - QPoint(marker_width // 2, marker_height // 2)
-        )
+        self._position_target_marker()
         self.target_marker.show()
         self.target_marker.raise_()
         self.status.setText(f"锁定：{target.name}")
@@ -658,6 +735,41 @@ def context_menu_command() -> str:
     return f'"{interpreter}" "{Path(__file__).resolve()}" --from-menu'
 
 
+def configure_windows_dpi_awareness() -> None:
+    """Use per-monitor DPI coordinates before Qt creates its first window."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+    except ImportError:
+        return
+
+    try:
+        set_context = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        set_context.argtypes = [ctypes.c_void_p]
+        set_context.restype = ctypes.c_bool
+        pointer_bits = ctypes.sizeof(ctypes.c_void_p) * 8
+        per_monitor_v2 = ctypes.c_void_p((-4) & ((1 << pointer_bits) - 1))
+        if set_context(per_monitor_v2):
+            return
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        result = ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        # S_OK means this call configured DPI awareness. E_ACCESSDENIED means
+        # a manifest or Qt already configured it, which is also acceptable.
+        if result in (0, -2147024891):
+            return
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (AttributeError, OSError):
+        pass
+
+
 def hide_console_window() -> None:
     """Hide a console inherited by a Windows context-menu launch."""
     if sys.platform != "win32":
@@ -671,6 +783,27 @@ def hide_console_window() -> None:
     except Exception:
         # A --windowed PyInstaller build has no console and needs no action.
         pass
+
+
+def install_interrupt_handlers(app: QApplication) -> QTimer:
+    """Keep Python signal handling alive so Ctrl+C exits terminal runs."""
+
+    def quit_application(*args) -> None:
+        app.quit()
+
+    for signal_name in ("SIGINT", "SIGBREAK"):
+        interrupt = getattr(signal, signal_name, None)
+        if interrupt is not None:
+            try:
+                signal.signal(interrupt, quit_application)
+            except (OSError, ValueError):
+                pass
+
+    timer = QTimer(app)
+    timer.setInterval(100)
+    timer.timeout.connect(lambda: None)
+    timer.start()
+    return timer
 
 
 def update_context_menu(install: bool) -> None:
@@ -714,15 +847,22 @@ def main() -> int:
             print(f"右键菜单操作失败：{error}", file=sys.stderr)
             return 1
 
-    hide_console_window()
+    # A terminal launch must keep its console so Ctrl+C and diagnostics work.
+    # Only the explicit Explorer context-menu launch suppresses it.
+    if args.from_menu:
+        hide_console_window()
 
+    configure_windows_dpi_awareness()
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
+    interrupt_timer = install_interrupt_handlers(app)
     # No launch path may auto-select a target. This also makes old installed
     # context-menu commands safe until the user re-registers the new command.
     window = WisadelDeleter(None)
     window.show()
-    return app.exec()
+    result = app.exec()
+    interrupt_timer.stop()
+    return result
 
 
 if __name__ == "__main__":
