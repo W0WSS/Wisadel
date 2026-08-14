@@ -164,6 +164,7 @@ class BombWidget(QWidget):
 
 class ExplosionWidget(QWidget):
     finished = pyqtSignal()
+    FRAME_INTERVAL_MS = 30
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
@@ -178,7 +179,7 @@ class ExplosionWidget(QWidget):
         self.show()
         self.raise_()
         QApplication.beep()
-        self._timer.start(40)
+        self._timer.start(self.FRAME_INTERVAL_MS)
 
     def stop(self) -> None:
         self._timer.stop()
