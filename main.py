@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import random
+import signal
 import sys
 from pathlib import Path
 
@@ -11,29 +11,40 @@ from PyQt6.QtCore import (
     QEasingCurve,
     QPoint,
     QPropertyAnimation,
+    QRect,
     QRectF,
     QTimer,
+    QUrl,
     Qt,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen, QPixmap
-from PyQt6.QtWidgets import (
-    QApplication,
-    QFileDialog,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QMessageBox,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
+from PyQt6.QtGui import (
+    QColor,
+    QCursor,
+    QFont,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QTransform,
 )
+from PyQt6.QtWidgets import QApplication, QLabel, QWidget
+from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 
+from desktop_selection import (
+    DesktopSelection,
+    DesktopSelectionUnavailable,
+    clicked_desktop_file,
+    cursor_position,
+    escape_key_down,
+    left_button_down,
+)
 from safety import FileFingerprint, assert_unchanged, validate_target
 
 
 APP_NAME = "WisadelDeleter"
-MENU_LABEL = "召唤维什戴尔处理此文件"
+MENU_LABEL = "召唤维什戴尔"
 
 
 def resource_path(relative: str) -> Path:
@@ -51,6 +62,7 @@ class SpriteAnimator(QLabel):
         self._frames: list[QPixmap] = []
         self._index = 0
         self._loop = False
+        self._flipped = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance)
 
@@ -76,12 +88,27 @@ class SpriteAnimator(QLabel):
             self.finished.emit()
             return
         self.resize(self._frames[0].size())
-        self.setPixmap(self._frames[0])
+        self._render_frame()
         self.show()
         self._timer.start(max(1, 1000 // fps))
 
     def stop(self) -> None:
         self._timer.stop()
+
+    def set_flipped(self, flipped: bool) -> None:
+        self._flipped = flipped
+        self._render_frame()
+
+    def _render_frame(self) -> None:
+        if not self._frames:
+            return
+        frame = self._frames[self._index]
+        if self._flipped:
+            frame = frame.transformed(
+                QTransform().scale(-1, 1),
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        self.setPixmap(frame)
 
     def _advance(self) -> None:
         self._index += 1
@@ -91,10 +118,10 @@ class SpriteAnimator(QLabel):
             else:
                 self._timer.stop()
                 self._index = len(self._frames) - 1
-                self.setPixmap(self._frames[self._index])
+                self._render_frame()
                 self.finished.emit()
                 return
-        self.setPixmap(self._frames[self._index])
+        self._render_frame()
         self.frame_changed.emit(self._index)
 
 
@@ -138,11 +165,13 @@ class BombWidget(QWidget):
 
 class ExplosionWidget(QWidget):
     finished = pyqtSignal()
+    FRAME_INTERVAL_MS = 28
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
-        self.resize(260, 260)
+        self.resize(480, 480)
         self._frame = 0
+        self._total_frames = 18
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance)
 
@@ -151,11 +180,15 @@ class ExplosionWidget(QWidget):
         self.show()
         self.raise_()
         QApplication.beep()
-        self._timer.start(45)
+        self._timer.start(self.FRAME_INTERVAL_MS)
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self.hide()
 
     def _advance(self) -> None:
         self._frame += 1
-        if self._frame > 13:
+        if self._frame > self._total_frames:
             self._timer.stop()
             self.hide()
             self.finished.emit()
@@ -166,20 +199,102 @@ class ExplosionWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         center = self.rect().center()
-        progress = self._frame / 13
-        painter.setOpacity(max(0.0, 1.0 - progress))
-        for index, color in enumerate(("#ffffff", "#ffd43b", "#ff5b35", "#d71932")):
-            radius = 20 + progress * (65 + index * 25)
-            painter.setPen(QPen(QColor(color), max(2, 16 - index * 3)))
-            painter.drawEllipse(center, int(radius), int(radius))
-        painter.setPen(QPen(QColor("#ffd43b"), 8))
-        for angle in range(0, 360, 45):
-            radians = math.radians(angle)
-            inner = 38 + progress * 45
-            outer = 75 + progress * 95
+        progress = self._frame / self._total_frames
+        fade = max(0.0, 1.0 - progress)
+        shake_x = int(math.sin(self._frame * 4.7) * 8 * fade)
+        shake_y = int(math.cos(self._frame * 5.3) * 6 * fade)
+        blast_center = center + QPoint(shake_x, shake_y)
+
+        # A short white flash makes the impact read before the fireball blooms.
+        if progress < 0.20:
+            flash = 1.0 - progress / 0.20
+            painter.setOpacity(flash * 0.92)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#fffdf2"))
+            radius = int(45 + (1.0 - flash) * 95)
+            painter.drawEllipse(blast_center, radius, radius)
+
+        # Jagged yellow/orange/red fireball.
+        fire_progress = min(1.0, progress / 0.55)
+        fire_fade = max(0.0, 1.0 - max(0.0, progress - 0.48) / 0.30)
+        for layer, (color, base_radius) in enumerate(
+            (("#d71932", 145), ("#ff5b22", 112), ("#ffd43b", 78), ("#fff6b0", 42))
+        ):
+            radius = base_radius * (0.24 + fire_progress * 0.76)
+            path = QPainterPath()
+            points = 28
+            for index in range(points):
+                angle = math.tau * index / points
+                spike = 1.0 if index % 2 == 0 else 0.62 + 0.08 * math.sin(index * 5.1)
+                point_radius = radius * spike
+                x = blast_center.x() + math.cos(angle) * point_radius
+                y = blast_center.y() + math.sin(angle) * point_radius
+                if index == 0:
+                    path.moveTo(x, y)
+                else:
+                    path.lineTo(x, y)
+            path.closeSubpath()
+            painter.setOpacity(fire_fade * (0.94 - layer * 0.08))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(color))
+            painter.drawPath(path)
+
+        # Expanding shockwaves stay visible after the bright core has faded.
+        shock_progress = min(1.0, progress / 0.82)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for index, color in enumerate(("#ffffff", "#ffd43b", "#ff4b35")):
+            ring_progress = max(0.0, min(1.0, shock_progress - index * 0.08))
+            ring_fade = max(0.0, 1.0 - ring_progress)
+            radius = int(32 + ring_progress * (170 + index * 26))
+            painter.setOpacity(ring_fade * 0.85)
+            painter.setPen(QPen(QColor(color), max(2, 13 - index * 3)))
+            painter.drawEllipse(blast_center, radius, radius)
+
+        # Sparks and fragments shoot outward at different speeds.
+        for index in range(24):
+            angle = math.radians((index * 137.5 + 17) % 360)
+            speed = 115 + (index % 7) * 17
+            distance = 22 + progress * speed
+            length = 12 + (index % 5) * 5
+            spark_fade = max(0.0, 1.0 - progress * (0.85 + (index % 3) * 0.12))
+            start = QPoint(
+                blast_center.x() + int(math.cos(angle) * distance),
+                blast_center.y() + int(math.sin(angle) * distance),
+            )
+            end = QPoint(
+                start.x() + int(math.cos(angle) * length),
+                start.y() + int(math.sin(angle) * length),
+            )
+            painter.setOpacity(spark_fade)
+            painter.setPen(QPen(QColor("#fff07a" if index % 3 else "#ff542e"), 3 + index % 3))
+            painter.drawLine(start, end)
+
+        # Dark smoke is deliberately last so the blast transitions cleanly
+        # into the large expression overlay.
+        smoke_progress = max(0.0, (progress - 0.34) / 0.66)
+        for index in range(12):
+            angle = math.radians(index * 31 + 9)
+            distance = 35 + smoke_progress * (55 + (index % 4) * 18)
+            radius = int(18 + smoke_progress * (24 + index % 3 * 7))
+            smoke_center = QPoint(
+                blast_center.x() + int(math.cos(angle) * distance),
+                blast_center.y() + int(math.sin(angle) * distance - smoke_progress * 34),
+            )
+            painter.setOpacity(smoke_progress * max(0.0, 1.0 - progress) * 1.5)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#25242a" if index % 2 else "#4b3a3d"))
+            painter.drawEllipse(smoke_center, radius, radius)
+
+        # Final debris rays punctuate the end of the effect.
+        painter.setOpacity(fade)
+        painter.setPen(QPen(QColor("#ffb11b"), 5))
+        for angle_degrees in range(0, 360, 30):
+            radians = math.radians(angle_degrees + 7)
+            inner = 75 + progress * 55
+            outer = 105 + progress * 115
             painter.drawLine(
-                QPoint(center.x() + int(math.cos(radians) * inner), center.y() + int(math.sin(radians) * inner)),
-                QPoint(center.x() + int(math.cos(radians) * outer), center.y() + int(math.sin(radians) * outer)),
+                QPoint(blast_center.x() + int(math.cos(radians) * inner), blast_center.y() + int(math.sin(radians) * inner)),
+                QPoint(blast_center.x() + int(math.cos(radians) * outer), blast_center.y() + int(math.sin(radians) * outer)),
             )
 
 
@@ -200,14 +315,21 @@ class ExpressionBurst(QWidget):
         self.hide()
 
     def start(self, center: QPoint) -> None:
-        # Prefer the seven extreme faces; keep the normal face as a rare gag.
-        path = random.choice(self._expressions + self._expressions[1:])
-        self._pixmap = QPixmap(str(path))
+        # Use the clearly angry face for the pre-attack reaction.
+        path = self._expressions[6]
+        full_expression = QPixmap(str(path))
+        # Crop to a face close-up so no torso or legs appear in the overlay.
+        head_height = max(1, int(full_expression.height() * 0.69))
+        self._pixmap = full_expression.copy(0, 0, full_expression.width(), head_height)
         self._frame = 0
         self.move(center - QPoint(self.width() // 2, self.height() // 2))
         self.show()
         self.raise_()
         self._timer.start(42)
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self.hide()
 
     def _advance(self) -> None:
         self._frame += 1
@@ -241,7 +363,7 @@ class ExpressionBurst(QWidget):
             return
         shake_x = int(math.sin(self._frame * 3.7) * 9 * opacity)
         shake_y = int(math.cos(self._frame * 4.4) * 7 * opacity)
-        target_height = max(1, int(410 * scale))
+        target_height = max(1, int(350 * scale))
         face = self._pixmap.scaledToHeight(target_height, Qt.TransformationMode.SmoothTransformation)
         painter.setOpacity(opacity)
         painter.drawPixmap(
@@ -251,14 +373,98 @@ class ExpressionBurst(QWidget):
         )
 
 
+class TargetReticle(QWidget):
+    """A highlight around the real desktop icon, never a fabricated file icon."""
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        area = self.rect().adjusted(5, 5, -5, -5)
+        painter.setPen(QPen(QColor(255, 44, 70, 230), 4))
+        painter.setBrush(QColor(215, 25, 50, 35))
+        painter.drawRoundedRect(QRectF(area), 17, 17)
+        painter.setPen(QPen(QColor("#fff4a3"), 3))
+        center = area.center()
+        painter.drawLine(center.x() - 14, center.y(), center.x() + 14, center.y())
+        painter.drawLine(center.x(), center.y() - 14, center.x(), center.y() + 14)
+
+
+def united_screen_geometry(rectangles: list[QRect]) -> QRect:
+    """Return one geometry covering every monitor, including negative origins."""
+    if not rectangles:
+        return QRect(0, 0, 1, 1)
+    geometry = QRect(rectangles[0])
+    for rectangle in rectangles[1:]:
+        geometry = geometry.united(rectangle)
+    return geometry
+
+
+def virtual_desktop_geometry() -> QRect:
+    rectangles = [screen.geometry() for screen in QApplication.screens()]
+    return united_screen_geometry(rectangles)
+
+
+def choose_attack_staging_position(
+    target: QPoint,
+    current: QPoint,
+    actor_width: int,
+    actor_height: int,
+    area: QRect,
+) -> tuple[QPoint, int]:
+    """Choose a nearby in-bounds position and horizontal throw direction."""
+    margin = 24
+    # Keep the actor visibly beside the icon.  A large gap makes the throw look
+    # disconnected even when the movement animation has technically finished.
+    gap = 28
+    minimum_x = area.left() + margin
+    minimum_y = area.top() + margin
+    maximum_x = max(minimum_x, area.right() + 1 - actor_width - margin)
+    maximum_y = max(minimum_y, area.bottom() + 1 - actor_height - margin)
+    target_y = min(maximum_y, max(minimum_y, target.y() - actor_height // 2))
+
+    left_x = target.x() - gap - actor_width
+    right_x = target.x() + gap
+    candidates: list[tuple[QPoint, int]] = []
+    if minimum_x <= left_x <= maximum_x:
+        candidates.append((QPoint(left_x, target_y), 1))
+    if minimum_x <= right_x <= maximum_x:
+        candidates.append((QPoint(right_x, target_y), -1))
+
+    if not candidates:
+        if target.x() < area.center().x():
+            candidates.append(
+                (QPoint(min(maximum_x, max(minimum_x, right_x)), target_y), -1)
+            )
+        else:
+            candidates.append(
+                (QPoint(min(maximum_x, max(minimum_x, left_x)), target_y), 1)
+            )
+
+    return min(
+        candidates,
+        key=lambda option: (
+            (option[0].x() - current.x()) ** 2
+            + (option[0].y() - current.y()) ** 2
+        ),
+    )
+
+
 class WisadelDeleter(QWidget):
     def __init__(self, initial_target: str | None = None) -> None:
         super().__init__()
         self._target: Path | None = None
         self._fingerprint: FileFingerprint | None = None
+        self._target_center = QPoint()
+        self._target_global: QPoint | None = None
         self._bomb_launched = False
         self._deletion_ok = False
-        self._initial_target = initial_target
+        self._last_error = ""
+        self._waiting_for_desktop = False
+        self._left_was_down = False
+        self._escape_was_down = False
+        self._actor_is_staged = False
+        self._summoning = False
+        self._throw_direction = 1
 
         self.setWindowTitle("维什戴尔的爆破委托")
         self.setWindowFlags(
@@ -267,11 +473,14 @@ class WisadelDeleter(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setGeometry(QApplication.primaryScreen().geometry())
+        self.setGeometry(virtual_desktop_geometry())
 
         self.sprite = SpriteAnimator(self)
         self.sprite.load_sheet(resource_path("assets/wisadel_april_fools_spritesheet-v3.png"))
-        self.sprite.finished.connect(self._summon_finished)
+        self.voice_player = QMediaPlayer(self)
+        self.voice_output = QAudioOutput(self)
+        self.voice_output.setVolume(1.0)
+        self.voice_player.setAudioOutput(self.voice_output)
 
         self.bomb = BombWidget(self)
         self.bomb.hide()
@@ -281,166 +490,329 @@ class WisadelDeleter(QWidget):
         self.expression_burst = ExpressionBurst(self)
         self.expression_burst.finished.connect(self._show_result)
 
-        self.target_marker = QLabel("📄", self)
-        self.target_marker.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.target_marker.setStyleSheet(
-            "font-size: 74px; background: rgba(17,19,24,210); border: 2px solid #d71932; border-radius: 24px;"
-        )
-        self.target_marker.resize(150, 150)
+        self.target_marker = TargetReticle(self)
+        self.target_marker.resize(110, 110)
         self.target_marker.hide()
 
-        self.card = self._build_card()
-        self.card.hide()
         self.status = QLabel("正在召唤维什戴尔……", self)
+        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status.setStyleSheet(
-            "color:white; font: 700 24px 'Microsoft YaHei'; background:rgba(10,11,15,205); padding:14px 24px; border-radius:16px;"
+            "color:white; font:700 24px 'Microsoft YaHei'; "
+            "background:rgba(10,11,15,215); padding:14px 24px; border-radius:16px;"
         )
         self.status.adjustSize()
+
+        self._input_timer = QTimer(self)
+        self._input_timer.setInterval(35)
+        self._input_timer.timeout.connect(self._poll_global_input)
+        self._input_timer.start()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.screenAdded.connect(self._screen_added)
+            app.screenRemoved.connect(self._sync_virtual_geometry)
+            for screen in app.screens():
+                self._connect_screen(screen)
 
         self._position_widgets()
         QTimer.singleShot(250, self._start_summon)
 
-    def _build_card(self) -> QFrame:
-        card = QFrame(self)
-        card.setObjectName("card")
-        card.setStyleSheet(
-            """
-            QFrame#card { background: rgba(18,20,27,244); border: 1px solid #444957; border-radius: 24px; }
-            QLabel { color: #f4f6fb; font-family: 'Microsoft YaHei'; }
-            QPushButton { border: 0; border-radius: 14px; padding: 13px 22px; font: 700 16px 'Microsoft YaHei'; }
-            QPushButton#choose { background: #3a3f4c; color: white; }
-            QPushButton#cancel { background: #30333c; color: #d8dbe4; }
-            QPushButton#confirm { background: #d71932; color: white; }
-            QPushButton:hover { border: 2px solid white; }
-            """
-        )
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(30, 26, 30, 26)
-        layout.setSpacing(14)
-        title = QLabel("爆破委托确认")
-        title.setStyleSheet("font-size: 27px; font-weight: 800;")
-        copy = QLabel("维什戴尔将向下列目标投掷炸弹。目标会被移入系统回收站，可尝试恢复。")
-        copy.setWordWrap(True)
-        copy.setStyleSheet("font-size: 15px; color: #bcc1ce;")
-        self.path_label = QLabel("尚未选择文件")
-        self.path_label.setWordWrap(True)
-        self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.path_label.setStyleSheet(
-            "font: 600 14px 'Consolas'; background:#0d0f14; border:1px solid #353945; border-radius:12px; padding:14px;"
-        )
-        self.warning = QLabel("请确认路径无误。操作只会在炸弹命中时执行。")
-        self.warning.setStyleSheet("font-size: 14px; color: #ffbd55;")
-        buttons = QHBoxLayout()
-        choose = QPushButton("重新选择")
-        choose.setObjectName("choose")
-        choose.clicked.connect(self._choose_target)
-        cancel = QPushButton("取消")
-        cancel.setObjectName("cancel")
-        cancel.clicked.connect(self.close)
-        self.confirm = QPushButton("确认并投掷")
-        self.confirm.setObjectName("confirm")
-        self.confirm.clicked.connect(self._confirm_attack)
-        buttons.addWidget(choose)
-        buttons.addStretch()
-        buttons.addWidget(cancel)
-        buttons.addWidget(self.confirm)
-        layout.addWidget(title)
-        layout.addWidget(copy)
-        layout.addWidget(self.path_label)
-        layout.addWidget(self.warning)
-        layout.addLayout(buttons)
-        card.resize(700, 270)
-        return card
-
     def _position_widgets(self) -> None:
-        self.sprite.move(max(30, self.width() // 8), self.height() - 390)
+        if not self._actor_is_staged and not self._summoning:
+            self.sprite.move(max(30, self.width() // 8), self.height() - 390)
         self.status.move((self.width() - self.status.width()) // 2, 45)
-        self.card.move((self.width() - self.card.width()) // 2, (self.height() - self.card.height()) // 2 - 20)
-        self.target_marker.move(self.width() * 3 // 4 - 75, self.height() // 2 - 75)
+
+    def _position_target_marker(self) -> None:
+        if self._target_global is None:
+            return
+        self._target_center = self.mapFromGlobal(self._target_global)
+        self.target_marker.move(
+            self._target_center
+            - QPoint(self.target_marker.width() // 2, self.target_marker.height() // 2)
+        )
+
+    def _connect_screen(self, screen) -> None:
+        try:
+            screen.geometryChanged.connect(self._sync_virtual_geometry)
+        except (AttributeError, TypeError):
+            pass
+
+    def _screen_added(self, screen) -> None:
+        self._connect_screen(screen)
+        self._sync_virtual_geometry()
+
+    def _sync_virtual_geometry(self, *args) -> None:
+        geometry = virtual_desktop_geometry()
+        if self.geometry() != geometry:
+            self.setGeometry(geometry)
+        self._position_widgets()
+        self._position_target_marker()
+        self.update()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         self._position_widgets()
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(4, 5, 8, 150))
-        painter.setPen(QPen(QColor(215, 25, 50, 40), 1))
-        gap = 52
-        for x in range(0, self.width(), gap):
-            painter.drawLine(x, 0, x, self.height())
-        for y in range(0, self.height(), gap):
+        opacity = 48 if self._waiting_for_desktop else 115
+        painter.fillRect(self.rect(), QColor(4, 5, 8, opacity))
+        painter.setPen(QPen(QColor(215, 25, 50, 24), 1))
+        for y in range(0, self.height(), 64):
             painter.drawLine(0, y, self.width(), y)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() == Qt.Key.Key_Escape:
             self.close()
 
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._input_timer.stop()
+        self.sprite.stop()
+        self.bomb.stop()
+        self.explosion.stop()
+        self.expression_burst.stop()
+        self.voice_player.stop()
+        for animation_name in (
+            "summon_fall_animation",
+            "actor_move_animation",
+            "bomb_animation",
+        ):
+            animation = getattr(self, animation_name, None)
+            if animation is not None:
+                animation.stop()
+        super().closeEvent(event)
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
     def _start_summon(self) -> None:
         self.show()
         self.raise_()
-        self.sprite.play([0, 1, 2, 3, 4], fps=7)
+        landing_position = self.sprite.pos()
+        fall_height = max(300, min(460, self.height() // 2))
+        start_position = landing_position - QPoint(0, fall_height)
+        self._summoning = True
+        self.sprite.move(start_position)
+        self.summon_fall_animation = QPropertyAnimation(self.sprite, b"pos", self)
+        self.summon_fall_animation.setDuration(520)
+        self.summon_fall_animation.setStartValue(start_position)
+        self.summon_fall_animation.setEndValue(landing_position)
+        self.summon_fall_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.summon_fall_animation.finished.connect(self._start_landing_sequence)
+        self.summon_fall_animation.start()
+        # Keep a neutral body pose during the actual descent.  Impact frames
+        # begin only after the positional fall reaches the floor.
+        self.sprite.play([4], fps=1, loop=True)
 
-    def _summon_finished(self) -> None:
+    def _start_landing_sequence(self) -> None:
+        self.sprite.stop()
+        # Show the impact smoke only briefly. The prone pose follows almost at
+        # the same instant that the positional fall reaches the floor.
+        self.sprite.play([0], fps=1, loop=True)
+        QTimer.singleShot(60, self._continue_landing_sequence)
+
+    def _continue_landing_sequence(self) -> None:
+        self.sprite.stop()
+        self.sprite.finished.connect(self._finish_summon_recovery)
+        self.sprite.play([2, 1, 3, 4], fps=5)
+
+    def _finish_summon_recovery(self) -> None:
         try:
-            self.sprite.finished.disconnect(self._summon_finished)
+            self.sprite.finished.disconnect(self._finish_summon_recovery)
         except TypeError:
             pass
+        self._summoning = False
         self.sprite.play([4], fps=1, loop=True)
-        self.status.setText("维什戴尔已就位：选择爆破目标")
+        self._show_waiting_selection()
+        self._play_voice("action-start.wav")
+
+    def _play_voice(self, filename: str) -> None:
+        self.voice_player.stop()
+        self.voice_player.setSource(
+            QUrl.fromLocalFile(str(resource_path(f"assets/audio/{filename}")))
+        )
+        self.voice_player.play()
+
+    def _set_click_through(self, enabled: bool) -> None:
+        if sys.platform != "win32":
+            return
+        flags = self.windowFlags()
+        transparent = Qt.WindowType.WindowTransparentForInput
+        already_enabled = bool(flags & transparent)
+        if already_enabled == enabled:
+            return
+        # setWindowFlags recreates a native top-level window on Windows and can
+        # reset it to the primary monitor. Always restore the complete virtual
+        # desktop geometry immediately afterwards.
+        self.setWindowFlags(flags | transparent if enabled else flags & ~transparent)
+        self.setGeometry(virtual_desktop_geometry())
+        self.show()
+        self.raise_()
+        self._position_widgets()
+        self._position_target_marker()
+
+    def _show_waiting_selection(self, message: str | None = None) -> None:
+        self._target = None
+        self._fingerprint = None
+        self._target_global = None
+        self._bomb_launched = False
+        self._deletion_ok = False
+        self._last_error = ""
+        self._waiting_for_desktop = True
+        self._left_was_down = False
+        self._actor_is_staged = False
+        self._throw_direction = 1
+        self.sprite.set_flipped(False)
+        self.target_marker.hide()
+        self.status.setText(message or "请选择桌面上的文件图标 · 单击后立即投弹 · Esc 取消")
         self.status.adjustSize()
         self._position_widgets()
-        if self._initial_target:
-            self._set_target(self._initial_target)
+        self.update()
+
+        if sys.platform == "win32":
+            self._set_click_through(True)
         else:
-            self._choose_target()
+            self.status.setText("桌面文件选取需要在 Windows 10/11 上运行")
+            self.status.adjustSize()
+            self._position_widgets()
 
-    def _choose_target(self) -> None:
-        self.setWindowOpacity(0.01)
-        selected, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择要移入回收站的文件",
-            str(Path.home()),
-            "所有文件 (*)",
-        )
-        self.setWindowOpacity(1.0)
-        if not selected:
-            if self._target is None:
-                self.close()
+    def _poll_global_input(self) -> None:
+        escape_pressed = escape_key_down()
+        if escape_pressed and not self._escape_was_down:
+            self._escape_was_down = True
+            self.close()
             return
-        self._set_target(selected)
+        self._escape_was_down = escape_pressed
+        if not self._waiting_for_desktop:
+            return
+        pressed = left_button_down()
+        if pressed:
+            self._left_was_down = True
+            return
+        if not self._left_was_down:
+            return
 
-    def _set_target(self, selected: str) -> None:
+        self._left_was_down = False
         try:
-            target, saved_fingerprint = validate_target(selected, __file__)
-        except (OSError, ValueError) as error:
-            QMessageBox.warning(self, "无法选择目标", str(error))
-            if self._target is None:
-                QTimer.singleShot(0, self._choose_target)
+            x, y = cursor_position()
+        except DesktopSelectionUnavailable as error:
+            self.status.setText(str(error))
+            self.status.adjustSize()
+            self._position_widgets()
             return
+        # QCursor uses Qt's DPI-aware coordinates while UI Automation expects
+        # native screen coordinates. Keep both so effects stay aligned at 125%+
+        # Windows display scaling.
+        qt_click = QCursor.pos()
+        QTimer.singleShot(
+            120,
+            lambda x=x, y=y, qt_click=qt_click: self._capture_desktop_click(
+                x, y, qt_click
+            ),
+        )
+
+    def _capture_desktop_click(self, x: int, y: int, qt_click: QPoint | None = None) -> None:
+        if not self._waiting_for_desktop:
+            return
+        try:
+            selection = clicked_desktop_file(x, y)
+        except DesktopSelectionUnavailable as error:
+            self.status.setText(str(error))
+            self.status.adjustSize()
+            self._position_widgets()
+            return
+        if selection is None:
+            self.status.setText("没有识别到桌面文件，请单击真实文件图标（不支持文件夹或系统图标）")
+            self.status.adjustSize()
+            self._position_widgets()
+            return
+        self._lock_target(selection, qt_click)
+
+    def _lock_target(
+        self, selection: DesktopSelection, qt_click: QPoint | None = None
+    ) -> None:
+        try:
+            target, saved_fingerprint = validate_target(selection.path, __file__)
+        except (OSError, ValueError) as error:
+            self._show_waiting_selection(f"无法锁定：{error} 请重新选择桌面文件")
+            return
+
+        self._waiting_for_desktop = False
+        self._set_click_through(False)
         self._target = target
         self._fingerprint = saved_fingerprint
-        self.path_label.setText(str(target))
-        self.warning.setText("请确认路径无误。目标将移入回收站，而非永久粉碎。")
-        self.confirm.setEnabled(True)
-        self.card.show()
-        self.card.raise_()
 
-    def _confirm_attack(self) -> None:
+        self._target_global = qt_click if qt_click is not None else QPoint(*selection.center)
+        self._target_center = self.mapFromGlobal(self._target_global)
+        marker_width = 110
+        marker_height = 110
+        self.target_marker.resize(marker_width, marker_height)
+        self._position_target_marker()
+        self.target_marker.show()
+        self.target_marker.raise_()
+        self.status.setText(f"锁定：{target.name} · 正在调整投掷位置")
+        self.status.adjustSize()
+        self._actor_is_staged = True
+        self._position_widgets()
+        self._approach_target()
+
+    def _approach_target(self) -> None:
+        screen = (
+            QApplication.screenAt(self._target_global)
+            if self._target_global is not None
+            else None
+        )
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is not None:
+            screen_geometry = screen.geometry()
+            local_screen_geometry = QRect(
+                self.mapFromGlobal(screen_geometry.topLeft()), screen_geometry.size()
+            )
+        else:
+            local_screen_geometry = self.rect()
+        destination, direction = choose_attack_staging_position(
+            target=self._target_center,
+            current=self.sprite.pos(),
+            actor_width=self.sprite.width(),
+            actor_height=self.sprite.height(),
+            area=local_screen_geometry,
+        )
+        self._throw_direction = direction
+        self.sprite.set_flipped(direction < 0)
+
+        distance = math.hypot(
+            destination.x() - self.sprite.x(), destination.y() - self.sprite.y()
+        )
+        if distance < 4:
+            self.sprite.move(destination)
+            QTimer.singleShot(0, self._show_angry_pose)
+            return
+
+        self.actor_move_animation = QPropertyAnimation(self.sprite, b"pos", self)
+        self.actor_move_animation.setDuration(
+            min(3200, max(650, int(distance * 1.8)))
+        )
+        self.actor_move_animation.setStartValue(self.sprite.pos())
+        self.actor_move_animation.setEndValue(destination)
+        self.actor_move_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self.actor_move_animation.finished.connect(self._show_angry_pose)
+        self.actor_move_animation.start()
+
+    def _show_angry_pose(self) -> None:
+        """Show the actor's angry sprite only after reaching the target."""
+        if self._target is None:
+            return
+        self.sprite.play([10], fps=1, loop=True)
+        QTimer.singleShot(420, self._start_attack)
+
+    def _start_attack(self) -> None:
         if self._target is None or self._fingerprint is None:
             return
         try:
             assert_unchanged(self._target, self._fingerprint)
         except (OSError, ValueError) as error:
-            QMessageBox.warning(self, "目标已变化", str(error))
-            self._target = None
-            self._fingerprint = None
-            self._choose_target()
+            self._show_waiting_selection(f"目标已变化：{error} 请重新选择")
             return
-        self.card.hide()
-        self.target_marker.show()
-        self.status.setText(f"锁定：{self._target.name}")
-        self.status.adjustSize()
-        self._position_widgets()
         self._bomb_launched = False
         self.sprite.stop()
         try:
@@ -455,9 +827,18 @@ class WisadelDeleter(QWidget):
             self._bomb_launched = True
             self._launch_bomb()
 
+    def _bomb_start_position(self) -> QPoint:
+        hand_x = self.sprite.width() - 55 if self._throw_direction > 0 else 55
+        hand_y = self.sprite.height() // 2
+        return self.sprite.pos() + QPoint(
+            hand_x - self.bomb.width() // 2,
+            hand_y - self.bomb.height() // 2,
+        )
+
     def _launch_bomb(self) -> None:
-        start = self.sprite.pos() + QPoint(self.sprite.width() - 60, self.sprite.height() // 2)
-        end = self.target_marker.pos() + QPoint(38, 38)
+        self._play_voice("combat-4.wav")
+        start = self._bomb_start_position()
+        end = self._target_center - QPoint(self.bomb.width() // 2, self.bomb.height() // 2)
         self.bomb.move(start)
         self.bomb.start()
         self.bomb.raise_()
@@ -468,11 +849,24 @@ class WisadelDeleter(QWidget):
         self.bomb_animation.setEasingCurve(QEasingCurve.Type.InQuad)
         self.bomb_animation.finished.connect(self._bomb_hit)
         self.bomb_animation.start()
+        QTimer.singleShot(240, self._settle_after_throw)
+
+    def _settle_after_throw(self) -> None:
+        """Release the throw pose while impact effects continue independently."""
+        if not self._bomb_launched or self._target is None:
+            return
+        try:
+            self.sprite.frame_changed.disconnect(self._attack_frame)
+        except TypeError:
+            pass
+        self.sprite.play([4], fps=1, loop=True)
 
     def _bomb_hit(self) -> None:
         self.bomb.stop()
-        center = self.target_marker.geometry().center()
-        self.explosion.move(center - QPoint(self.explosion.width() // 2, self.explosion.height() // 2))
+        self.explosion.move(
+            self._target_center
+            - QPoint(self.explosion.width() // 2, self.explosion.height() // 2)
+        )
         self.target_marker.hide()
         self._delete_target()
         self.explosion.start()
@@ -490,7 +884,7 @@ class WisadelDeleter(QWidget):
                 raise OSError("系统没有确认目标已移入回收站。")
         except Exception as error:  # Keep the UI alive and show the exact failure.
             self._deletion_ok = False
-            self.warning.setText(f"操作失败：{error}")
+            self._last_error = str(error)
 
     def _show_result(self) -> None:
         try:
@@ -499,25 +893,114 @@ class WisadelDeleter(QWidget):
             pass
         if self._deletion_ok:
             self.status.setText("任务完成：目标已移入回收站")
-            self.sprite.play([10, 11, 12, 10, 11, 12], fps=6)
-            QTimer.singleShot(2300, self.close)
+            try:
+                self.sprite.finished.disconnect(self._close_after_success)
+            except TypeError:
+                pass
+            self.sprite.finished.connect(self._close_after_success)
+            self.sprite.play([11, 12], fps=6)
+            # Fallback in case a platform-specific timer issue prevents the
+            # sprite completion signal from being delivered.
+            QTimer.singleShot(3000, self.close)
         else:
-            self.status.setText("任务中止：文件未被移动")
-            self.card.show()
-            self.confirm.setEnabled(False)
-            self.confirm.setText("操作未执行")
+            self.status.setText(f"任务中止：{self._last_error or '文件未被移动'}")
+            self.sprite.play([4], fps=1, loop=True)
+            QTimer.singleShot(2200, self._show_waiting_selection)
         self.status.adjustSize()
         self._position_widgets()
 
+    def _close_after_success(self) -> None:
+        try:
+            self.sprite.finished.disconnect(self._close_after_success)
+        except TypeError:
+            pass
+        QTimer.singleShot(450, self.close)
+
     def _start_expression_burst(self) -> None:
-        center = self.target_marker.geometry().center()
-        self.expression_burst.start(center)
+        self.expression_burst.start(self._target_center)
 
 
 def context_menu_command() -> str:
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}" "%1"'
-    return f'"{sys.executable}" "{Path(__file__).resolve()}" "%1"'
+        return f'"{sys.executable}" --from-menu'
+
+    interpreter = Path(sys.executable)
+    if sys.platform == "win32":
+        pythonw = interpreter.with_name("pythonw.exe")
+        if pythonw.exists():
+            interpreter = pythonw
+    return f'"{interpreter}" "{Path(__file__).resolve()}" --from-menu'
+
+
+def configure_windows_dpi_awareness() -> None:
+    """Use per-monitor DPI coordinates before Qt creates its first window."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+    except ImportError:
+        return
+
+    try:
+        set_context = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        set_context.argtypes = [ctypes.c_void_p]
+        set_context.restype = ctypes.c_bool
+        pointer_bits = ctypes.sizeof(ctypes.c_void_p) * 8
+        per_monitor_v2 = ctypes.c_void_p((-4) & ((1 << pointer_bits) - 1))
+        if set_context(per_monitor_v2):
+            return
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        result = ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        # S_OK means this call configured DPI awareness. E_ACCESSDENIED means
+        # a manifest or Qt already configured it, which is also acceptable.
+        if result in (0, -2147024891):
+            return
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (AttributeError, OSError):
+        pass
+
+
+def hide_console_window() -> None:
+    """Hide a console inherited by a Windows context-menu launch."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        console = ctypes.windll.kernel32.GetConsoleWindow()
+        if console:
+            ctypes.windll.user32.ShowWindow(console, 0)
+    except Exception:
+        # A --windowed PyInstaller build has no console and needs no action.
+        pass
+
+
+def install_interrupt_handlers(app: QApplication) -> QTimer:
+    """Keep Python signal handling alive so Ctrl+C exits terminal runs."""
+
+    def quit_application(*args) -> None:
+        app.quit()
+
+    for signal_name in ("SIGINT", "SIGBREAK"):
+        interrupt = getattr(signal, signal_name, None)
+        if interrupt is not None:
+            try:
+                signal.signal(interrupt, quit_application)
+            except (OSError, ValueError):
+                pass
+
+    timer = QTimer(app)
+    timer.setInterval(100)
+    timer.timeout.connect(lambda: None)
+    timer.start()
+    return timer
 
 
 def update_context_menu(install: bool) -> None:
@@ -542,10 +1025,11 @@ def update_context_menu(install: bool) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="召唤维什戴尔，把选定文件移入回收站。")
-    parser.add_argument("target", nargs="?", help="可选的预选目标路径")
+    parser.add_argument("target", nargs="?", help="兼容旧右键菜单的路径参数（不会自动选中）")
     menu = parser.add_mutually_exclusive_group()
     menu.add_argument("--install-menu", action="store_true", help="安装 Windows 文件右键菜单")
     menu.add_argument("--uninstall-menu", action="store_true", help="卸载 Windows 文件右键菜单")
+    parser.add_argument("--from-menu", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -560,11 +1044,22 @@ def main() -> int:
             print(f"右键菜单操作失败：{error}", file=sys.stderr)
             return 1
 
+    # A terminal launch must keep its console so Ctrl+C and diagnostics work.
+    # Only the explicit Explorer context-menu launch suppresses it.
+    if args.from_menu:
+        hide_console_window()
+
+    configure_windows_dpi_awareness()
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
-    window = WisadelDeleter(args.target)
+    interrupt_timer = install_interrupt_handlers(app)
+    # No launch path may auto-select a target. This also makes old installed
+    # context-menu commands safe until the user re-registers the new command.
+    window = WisadelDeleter(None)
     window.show()
-    return app.exec()
+    result = app.exec()
+    interrupt_timer.stop()
+    return result
 
 
 if __name__ == "__main__":
