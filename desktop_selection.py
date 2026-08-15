@@ -88,32 +88,46 @@ def resolve_desktop_item(
     return unique[0] if len(unique) == 1 else None
 
 
-def _list_item_ancestor(control, auto):
-    current = control
-    for _ in range(7):
-        if current is None:
-            return None
-        try:
-            if current.ControlType == auto.ControlType.ListItemControl:
-                return current
-            current = current.GetParentControl()
-        except Exception:
-            return None
-    return None
+def _desktop_list_items(auto):
+    """Yield ListItem controls from the Windows desktop hosts only."""
+    hosts = []
+    progman = auto.PaneControl(searchDepth=1, ClassName="Progman")
+    if progman.Exists(0, 0):
+        hosts.append(progman)
 
-
-def _belongs_to_windows_desktop(control) -> bool:
-    current = control
-    for _ in range(10):
-        if current is None:
-            return False
+    for control in auto.GetRootControl().GetChildren():
         try:
-            if current.ClassName in {"Progman", "WorkerW"}:
-                return True
-            current = current.GetParentControl()
+            if control.ClassName == "WorkerW":
+                hosts.append(control)
         except Exception:
-            return False
-    return False
+            continue
+
+    seen: set[tuple[str, int, int, int, int]] = set()
+    for host in hosts:
+        for walk_result in auto.WalkTree(
+            host,
+            getChildren=lambda item: item.GetChildren(),
+            maxDepth=6,
+        ):
+            # uiautomation releases have returned both two- and three-element
+            # tuples from WalkTree.  The control is consistently first.
+            control = walk_result[0]
+            if control.ControlType != auto.ControlType.ListItemControl:
+                continue
+            try:
+                rectangle = control.BoundingRectangle
+                key = (
+                    control.Name,
+                    int(rectangle.left),
+                    int(rectangle.top),
+                    int(rectangle.right),
+                    int(rectangle.bottom),
+                )
+            except Exception:
+                continue
+            if key not in seen:
+                seen.add(key)
+                yield control
 
 
 def clicked_desktop_file(x: int, y: int) -> DesktopSelection | None:
@@ -129,23 +143,25 @@ def clicked_desktop_file(x: int, y: int) -> DesktopSelection | None:
 
     try:
         auto.SetGlobalSearchTimeout(0.7)
-        item = _list_item_ancestor(auto.ControlFromPoint(x, y), auto)
+        item = None
+        inspected = 0
+        for candidate in _desktop_list_items(auto):
+            inspected += 1
+            rectangle = candidate.BoundingRectangle
+            if rectangle.left <= x <= rectangle.right and rectangle.top <= y <= rectangle.bottom:
+                item = candidate
+                break
         if item is None:
-            return None
-        if not _belongs_to_windows_desktop(item):
-            return None
+            raise DesktopSelectionUnavailable(
+                f"诊断：枚举了 {inspected} 个桌面图标，但坐标 ({x}, {y}) 没有命中任何图标。"
+            )
         rectangle = item.BoundingRectangle
-        if not (rectangle.left <= x <= rectangle.right and rectangle.top <= y <= rectangle.bottom):
-            return None
-        try:
-            if not item.GetSelectionItemPattern().IsSelected:
-                return None
-        except Exception:
-            return None
-
         path = resolve_desktop_item(item.Name)
         if path is None:
-            return None
+            directories = ", ".join(str(path) for path in desktop_directories()) or "<未找到桌面目录>"
+            raise DesktopSelectionUnavailable(
+                f"诊断：图标名称 {item.Name!r} 无法唯一映射到真实文件；桌面目录：{directories}"
+            )
         return DesktopSelection(
             path=path,
             left=int(rectangle.left),

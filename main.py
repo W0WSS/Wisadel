@@ -164,13 +164,13 @@ class BombWidget(QWidget):
 
 class ExplosionWidget(QWidget):
     finished = pyqtSignal()
-    FRAME_INTERVAL_MS = 30
+    FRAME_INTERVAL_MS = 28
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.resize(480, 480)
         self._frame = 0
-        self._total_frames = 25
+        self._total_frames = 18
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance)
 
@@ -414,7 +414,9 @@ def choose_attack_staging_position(
 ) -> tuple[QPoint, int]:
     """Choose a nearby in-bounds position and horizontal throw direction."""
     margin = 24
-    gap = 72
+    # Keep the actor visibly beside the icon.  A large gap makes the throw look
+    # disconnected even when the movement animation has technically finished.
+    gap = 28
     minimum_x = area.left() + margin
     minimum_y = area.top() + margin
     maximum_x = max(minimum_x, area.right() + 1 - actor_width - margin)
@@ -462,6 +464,7 @@ class WisadelDeleter(QWidget):
         self._left_was_down = False
         self._escape_was_down = False
         self._actor_is_staged = False
+        self._summoning = False
         self._throw_direction = 1
 
         self.setWindowTitle("维什戴尔的爆破委托")
@@ -475,7 +478,6 @@ class WisadelDeleter(QWidget):
 
         self.sprite = SpriteAnimator(self)
         self.sprite.load_sheet(resource_path("assets/wisadel_april_fools_spritesheet-v3.png"))
-        self.sprite.finished.connect(self._summon_finished)
 
         self.bomb = BombWidget(self)
         self.bomb.hide()
@@ -513,7 +515,7 @@ class WisadelDeleter(QWidget):
         QTimer.singleShot(250, self._start_summon)
 
     def _position_widgets(self) -> None:
-        if not self._actor_is_staged:
+        if not self._actor_is_staged and not self._summoning:
             self.sprite.move(max(30, self.width() // 8), self.height() - 390)
         self.status.move((self.width() - self.status.width()) // 2, 45)
 
@@ -565,7 +567,11 @@ class WisadelDeleter(QWidget):
         self.bomb.stop()
         self.explosion.stop()
         self.expression_burst.stop()
-        for animation_name in ("actor_move_animation", "bomb_animation"):
+        for animation_name in (
+            "summon_fall_animation",
+            "actor_move_animation",
+            "bomb_animation",
+        ):
             animation = getattr(self, animation_name, None)
             if animation is not None:
                 animation.stop()
@@ -577,13 +583,35 @@ class WisadelDeleter(QWidget):
     def _start_summon(self) -> None:
         self.show()
         self.raise_()
-        self.sprite.play([0, 1, 2, 3, 4], fps=7)
+        landing_position = self.sprite.pos()
+        fall_height = max(300, min(460, self.height() // 2))
+        start_position = landing_position - QPoint(0, fall_height)
+        self._summoning = True
+        self.sprite.move(start_position)
+        self.summon_fall_animation = QPropertyAnimation(self.sprite, b"pos", self)
+        self.summon_fall_animation.setDuration(820)
+        self.summon_fall_animation.setStartValue(start_position)
+        self.summon_fall_animation.setEndValue(landing_position)
+        self.summon_fall_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.summon_fall_animation.finished.connect(self._start_landing_sequence)
+        self.summon_fall_animation.start()
+        # Keep a neutral body pose during the actual descent.  Impact frames
+        # begin only after the positional fall reaches the floor.
+        self.sprite.play([4], fps=1, loop=True)
 
-    def _summon_finished(self) -> None:
+    def _start_landing_sequence(self) -> None:
+        self.sprite.stop()
+        self.sprite.finished.connect(self._finish_summon_recovery)
+        # Play the confirmed landing-to-idle order continuously, without
+        # repeated frames or artificial holds.
+        self.sprite.play([0, 2, 1, 3, 4], fps=5)
+
+    def _finish_summon_recovery(self) -> None:
         try:
-            self.sprite.finished.disconnect(self._summon_finished)
+            self.sprite.finished.disconnect(self._finish_summon_recovery)
         except TypeError:
             pass
+        self._summoning = False
         self.sprite.play([4], fps=1, loop=True)
         self._show_waiting_selection()
 
@@ -744,10 +772,12 @@ class WisadelDeleter(QWidget):
             return
 
         self.actor_move_animation = QPropertyAnimation(self.sprite, b"pos", self)
-        self.actor_move_animation.setDuration(min(900, max(280, int(distance * 1.1))))
+        self.actor_move_animation.setDuration(
+            min(3200, max(650, int(distance * 1.8)))
+        )
         self.actor_move_animation.setStartValue(self.sprite.pos())
         self.actor_move_animation.setEndValue(destination)
-        self.actor_move_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.actor_move_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
         self.actor_move_animation.finished.connect(self._start_attack)
         self.actor_move_animation.start()
 
@@ -794,6 +824,17 @@ class WisadelDeleter(QWidget):
         self.bomb_animation.setEasingCurve(QEasingCurve.Type.InQuad)
         self.bomb_animation.finished.connect(self._bomb_hit)
         self.bomb_animation.start()
+        QTimer.singleShot(240, self._settle_after_throw)
+
+    def _settle_after_throw(self) -> None:
+        """Release the throw pose while impact effects continue independently."""
+        if not self._bomb_launched or self._target is None:
+            return
+        try:
+            self.sprite.frame_changed.disconnect(self._attack_frame)
+        except TypeError:
+            pass
+        self.sprite.play([4], fps=1, loop=True)
 
     def _bomb_hit(self) -> None:
         self.bomb.stop()
@@ -827,14 +868,28 @@ class WisadelDeleter(QWidget):
             pass
         if self._deletion_ok:
             self.status.setText("任务完成：目标已移入回收站")
-            self.sprite.play([10, 11, 12, 10, 11, 12], fps=6)
-            QTimer.singleShot(2300, self.close)
+            try:
+                self.sprite.finished.disconnect(self._close_after_success)
+            except TypeError:
+                pass
+            self.sprite.finished.connect(self._close_after_success)
+            self.sprite.play([10, 11, 12], fps=6)
+            # Fallback in case a platform-specific timer issue prevents the
+            # sprite completion signal from being delivered.
+            QTimer.singleShot(3000, self.close)
         else:
             self.status.setText(f"任务中止：{self._last_error or '文件未被移动'}")
             self.sprite.play([4], fps=1, loop=True)
             QTimer.singleShot(2200, self._show_waiting_selection)
         self.status.adjustSize()
         self._position_widgets()
+
+    def _close_after_success(self) -> None:
+        try:
+            self.sprite.finished.disconnect(self._close_after_success)
+        except TypeError:
+            pass
+        QTimer.singleShot(450, self.close)
 
     def _start_expression_burst(self) -> None:
         self.expression_burst.start(self._target_center)
