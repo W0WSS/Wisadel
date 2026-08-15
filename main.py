@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import random
 import signal
 import sys
 from pathlib import Path
@@ -15,6 +14,7 @@ from PyQt6.QtCore import (
     QRect,
     QRectF,
     QTimer,
+    QUrl,
     Qt,
     pyqtSignal,
 )
@@ -30,6 +30,7 @@ from PyQt6.QtGui import (
     QTransform,
 )
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
+from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 
 from desktop_selection import (
     DesktopSelection,
@@ -314,12 +315,10 @@ class ExpressionBurst(QWidget):
         self.hide()
 
     def start(self, center: QPoint) -> None:
-        # Prefer the seven extreme faces; keep the normal face as a rare gag.
-        path = random.choice(self._expressions + self._expressions[1:])
+        # Use the clearly angry face for the pre-attack reaction.
+        path = self._expressions[6]
         full_expression = QPixmap(str(path))
-        # The reference sheet includes a tiny body, but the post-explosion gag
-        # in the video is a face close-up. Crop before scaling so no torso or
-        # legs can appear in the overlay.
+        # Crop to a face close-up so no torso or legs appear in the overlay.
         head_height = max(1, int(full_expression.height() * 0.69))
         self._pixmap = full_expression.copy(0, 0, full_expression.width(), head_height)
         self._frame = 0
@@ -478,6 +477,10 @@ class WisadelDeleter(QWidget):
 
         self.sprite = SpriteAnimator(self)
         self.sprite.load_sheet(resource_path("assets/wisadel_april_fools_spritesheet-v3.png"))
+        self.voice_player = QMediaPlayer(self)
+        self.voice_output = QAudioOutput(self)
+        self.voice_output.setVolume(1.0)
+        self.voice_player.setAudioOutput(self.voice_output)
 
         self.bomb = BombWidget(self)
         self.bomb.hide()
@@ -567,6 +570,7 @@ class WisadelDeleter(QWidget):
         self.bomb.stop()
         self.explosion.stop()
         self.expression_burst.stop()
+        self.voice_player.stop()
         for animation_name in (
             "summon_fall_animation",
             "actor_move_animation",
@@ -589,7 +593,7 @@ class WisadelDeleter(QWidget):
         self._summoning = True
         self.sprite.move(start_position)
         self.summon_fall_animation = QPropertyAnimation(self.sprite, b"pos", self)
-        self.summon_fall_animation.setDuration(820)
+        self.summon_fall_animation.setDuration(520)
         self.summon_fall_animation.setStartValue(start_position)
         self.summon_fall_animation.setEndValue(landing_position)
         self.summon_fall_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -601,10 +605,15 @@ class WisadelDeleter(QWidget):
 
     def _start_landing_sequence(self) -> None:
         self.sprite.stop()
+        # Show the impact smoke only briefly. The prone pose follows almost at
+        # the same instant that the positional fall reaches the floor.
+        self.sprite.play([0], fps=1, loop=True)
+        QTimer.singleShot(60, self._continue_landing_sequence)
+
+    def _continue_landing_sequence(self) -> None:
+        self.sprite.stop()
         self.sprite.finished.connect(self._finish_summon_recovery)
-        # Play the confirmed landing-to-idle order continuously, without
-        # repeated frames or artificial holds.
-        self.sprite.play([0, 2, 1, 3, 4], fps=5)
+        self.sprite.play([2, 1, 3, 4], fps=5)
 
     def _finish_summon_recovery(self) -> None:
         try:
@@ -614,6 +623,14 @@ class WisadelDeleter(QWidget):
         self._summoning = False
         self.sprite.play([4], fps=1, loop=True)
         self._show_waiting_selection()
+        self._play_voice("action-start.wav")
+
+    def _play_voice(self, filename: str) -> None:
+        self.voice_player.stop()
+        self.voice_player.setSource(
+            QUrl.fromLocalFile(str(resource_path(f"assets/audio/{filename}")))
+        )
+        self.voice_player.play()
 
     def _set_click_through(self, enabled: bool) -> None:
         if sys.platform != "win32":
@@ -768,7 +785,7 @@ class WisadelDeleter(QWidget):
         )
         if distance < 4:
             self.sprite.move(destination)
-            QTimer.singleShot(0, self._start_attack)
+            QTimer.singleShot(0, self._show_angry_pose)
             return
 
         self.actor_move_animation = QPropertyAnimation(self.sprite, b"pos", self)
@@ -778,8 +795,15 @@ class WisadelDeleter(QWidget):
         self.actor_move_animation.setStartValue(self.sprite.pos())
         self.actor_move_animation.setEndValue(destination)
         self.actor_move_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
-        self.actor_move_animation.finished.connect(self._start_attack)
+        self.actor_move_animation.finished.connect(self._show_angry_pose)
         self.actor_move_animation.start()
+
+    def _show_angry_pose(self) -> None:
+        """Show the actor's angry sprite only after reaching the target."""
+        if self._target is None:
+            return
+        self.sprite.play([10], fps=1, loop=True)
+        QTimer.singleShot(420, self._start_attack)
 
     def _start_attack(self) -> None:
         if self._target is None or self._fingerprint is None:
@@ -812,6 +836,7 @@ class WisadelDeleter(QWidget):
         )
 
     def _launch_bomb(self) -> None:
+        self._play_voice("combat-4.wav")
         start = self._bomb_start_position()
         end = self._target_center - QPoint(self.bomb.width() // 2, self.bomb.height() // 2)
         self.bomb.move(start)
@@ -873,7 +898,7 @@ class WisadelDeleter(QWidget):
             except TypeError:
                 pass
             self.sprite.finished.connect(self._close_after_success)
-            self.sprite.play([10, 11, 12], fps=6)
+            self.sprite.play([11, 12], fps=6)
             # Fallback in case a platform-specific timer issue prevents the
             # sprite completion signal from being delivered.
             QTimer.singleShot(3000, self.close)
